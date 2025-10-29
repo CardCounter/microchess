@@ -22,7 +22,7 @@ NUM_SQUARES = BOARD_ROWS * BOARD_COLS
 
 ACTION_BASE = NUM_SQUARES * NUM_SQUARES  # 400
 ACTION_SIZE = ACTION_BASE * 3            # 1200
-PROMO_NONE_OR_ROOK = 0
+PROMO_ROOK = 0
 PROMO_KNIGHT = 1
 PROMO_BISHOP = 2
 
@@ -34,6 +34,8 @@ class MicrochessEnv:
         self.has_moved_king = {WHITE: False, BLACK: False}
         self.has_moved_rook = {WHITE: False, BLACK: False}
         self.move_history = []
+        self.halfmove_clock = 0  # counts plies since last capture or pawn move
+        self.repetition_history = []  # list of board hash strings for repetition tracking
         self.reset()
 
     def reset(self):
@@ -48,12 +50,25 @@ class MicrochessEnv:
         self.has_moved_king = {WHITE: False, BLACK: False}
         self.has_moved_rook = {WHITE: False, BLACK: False}
         self.move_history = []
+        self.halfmove_clock = 0
+        self.repetition_history = [self._board_hash()]
         return self._get_obs()
 
     def _get_obs(self):
         flat_board = self.board.flatten().astype(np.int8)
         stm = np.int8(self.side_to_move)
         return np.concatenate([flat_board, np.array([stm], dtype=np.int8)], axis=0)
+
+    def _board_hash(self):
+        # simple hash: board layout + side to move + castle rights
+        # (castle rights matter because they affect legality of future moves)
+        parts = [str(int(x)) for x in self.board.flatten()]
+        parts.append(str(int(self.side_to_move)))
+        parts.append("K" if not self.has_moved_king[WHITE] else "k")
+        parts.append("R" if not self.has_moved_rook[WHITE] else "r")
+        parts.append("K" if not self.has_moved_king[BLACK] else "k")
+        parts.append("R" if not self.has_moved_rook[BLACK] else "r")
+        return ",".join(parts)
 
     def step(self, action_id):
         promo_bucket = action_id // ACTION_BASE
@@ -74,7 +89,7 @@ class MicrochessEnv:
                         move_obj = m
                         break
                 else:
-                    if promo_bucket == 0:
+                    if promo_bucket == PROMO_ROOK: # bucket 0
                         move_obj = m
                         break
 
@@ -96,7 +111,7 @@ class MicrochessEnv:
                 legal.append(m)
         return legal
 
-    def _generate_pseudo_legal_moves(self, side):
+    def _generate_pseudo_legal_moves(self, side, include_castle=True):
         moves = []
         for r in range(BOARD_ROWS):
             for c in range(BOARD_COLS):
@@ -114,7 +129,8 @@ class MicrochessEnv:
                     moves += self._knight_moves(r, c, side)
                 elif piece_type == PIECE_WP:
                     moves += self._pawn_moves(r, c, side)
-        moves += self._castle_moves(side)
+        if include_castle:
+            moves += self._castle_moves(side)
         return moves
 
     def _inside(self, r, c):
@@ -173,19 +189,51 @@ class MicrochessEnv:
         fwd_r = r + step
 
         def add_move(rr, cc, is_capture):
-            if not self._inside(rr, cc): return
+            if not self._inside(rr, cc):
+                return
             t = self.board[rr, cc]
-            if is_capture and (t == 0 or np.sign(t) != -side): return
-            if not is_capture and t != 0: return
-            promo = self._is_promo_rank(rr, side)
-            promo_types = [0,1,2] if promo else [None]
-            for pt in promo_types:
-                out.append({"from": (r,c), "to": (rr,cc), "castle": False,
-                            "promotion": promo, "promo_type": pt})
+            # capture move: square must contain enemy piece
+            if is_capture:
+                if t == 0 or np.sign(t) != -side:
+                    return
+            else:
+                # quiet move: square must be empty
+                if t != 0:
+                    return
 
+            promo = self._is_promo_rank(rr, side)
+            promo_types = [PROMO_ROOK, PROMO_KNIGHT, PROMO_BISHOP] if promo else [None]
+            for pt in promo_types:
+                out.append({
+                    "from": (r, c),
+                    "to": (rr, cc),
+                    "castle": False,
+                    "promotion": promo,
+                    "promo_type": pt
+                })
+
+        # single step forward
         add_move(fwd_r, c, False)
+
+        # double step forward (only from starting rank, path must be clear, and landing square clear)
+        if side == WHITE:
+            start_rank = BOARD_ROWS - 2  # row 3 in 0-indexed 5x4
+        else:
+            start_rank = 1               # row 1 for black in initial position
+
+        two_r = r + 2 * step
+        if r == start_rank:
+            # need inside board, intermediate empty, landing empty
+            if self._inside(fwd_r, c) and self.board[fwd_r, c] == 0:
+                if self._inside(two_r, c) and self.board[two_r, c] == 0:
+                    # can't be a promotion because you're skipping over promo rank anyway,
+                    # but we'll still run through add_move for consistency
+                    add_move(two_r, c, False)
+
+        # diagonal captures
         for dc in [-1, 1]:
-            add_move(fwd_r, c+dc, True)
+            add_move(fwd_r, c + dc, True)
+
         return out
 
     def _is_promo_rank(self, r, side):
@@ -194,9 +242,9 @@ class MicrochessEnv:
     def _castle_moves(self, side):
         out = []
         if side == WHITE:
-            king_start, rook_start, king_end, rook_end = (4,3), (4,0), (4,1), (4,2)
+            king_start, rook_start, king_end = (4,3), (4,0), (4,1)
         else:
-            king_start, rook_start, king_end, rook_end = (0,0), (0,3), (0,2), (0,1)
+            king_start, rook_start, king_end = (0,0), (0,3), (0,2)
 
         kr, kc = king_start
         rr, rc = rook_start
@@ -211,7 +259,7 @@ class MicrochessEnv:
         return out
 
     def _is_square_attacked(self, r, c, by_side):
-        for m in self._generate_pseudo_legal_moves(by_side):
+        for m in self._generate_pseudo_legal_moves(by_side, include_castle=False):
             if m["to"] == (r,c): return True
         return False
 
@@ -230,48 +278,154 @@ class MicrochessEnv:
         fr, fc = m["from"]
         tr, tc = m["to"]
         piece = self.board[fr,fc]
+        target = self.board[tr,tc]
+
+        # detect capture or pawn move for 50-move rule reset
+        is_capture = (target != 0)
+        is_pawn_move = (abs(piece) == PIECE_WP)
+
+        # move piece
         self.board[tr,tc] = piece
         self.board[fr,fc] = 0
 
+        # handle castling rook movement
         if m["castle"]:
             if self.side_to_move == WHITE:
+                # white king goes (4,3)->(4,1), rook (4,0)->(4,2) per rules:
+                # NOTE: in _castle_moves we defined king_end as (4,1) for white and (0,2) for black,
+                # and we later hard-move rook squares to match that convention.
+                # Here we mirror the logic used earlier in your code.
                 self.board[4,2] = PIECE_WR
                 self.board[4,0] = 0
-                self.has_moved_king[WHITE] = self.has_moved_rook[WHITE] = True
+                self.has_moved_king[WHITE] = True
+                self.has_moved_rook[WHITE] = True
             else:
                 self.board[0,1] = PIECE_BR
                 self.board[0,3] = 0
-                self.has_moved_king[BLACK] = self.has_moved_rook[BLACK] = True
+                self.has_moved_king[BLACK] = True
+                self.has_moved_rook[BLACK] = True
 
+        # handle promotion
         if m["promotion"]:
             if self.side_to_move == WHITE:
-                if m["promo_type"] == 0:
+                if m["promo_type"] == PROMO_ROOK:
                     self.board[tr,tc] = PIECE_WR
                 elif m["promo_type"] == 1:
                     self.board[tr,tc] = PIECE_WN
                 elif m["promo_type"] == 2:
                     self.board[tr,tc] = PIECE_WB
             else:
-                if m["promo_type"] == 0:
+                if m["promo_type"] == PROMO_ROOK:
                     self.board[tr,tc] = PIECE_BR
                 elif m["promo_type"] == 1:
                     self.board[tr,tc] = PIECE_BN
                 elif m["promo_type"] == 2:
                     self.board[tr,tc] = PIECE_BB
 
+        # update moved flags for rook/king
         if abs(piece) == PIECE_WK:
             self.has_moved_king[self.side_to_move] = True
         if abs(piece) == PIECE_WR:
             self.has_moved_rook[self.side_to_move] = True
 
+        # update 50-move (really 100-ply) clock
+        if is_capture or is_pawn_move or m["promotion"]:
+            self.halfmove_clock = 0
+        else:
+            self.halfmove_clock += 1
+
+        # flip side and record position / history
         self.side_to_move *= -1
         self.move_history.append(m)
+        self.repetition_history.append(self._board_hash())
+
+    def _is_insufficient_material(self):
+        """
+        Return True if it's impossible to force mate.
+        We consider these positions auto-draw:
+          - K vs K
+          - K+N vs K
+          - K+B vs K
+        We do NOT auto-draw K+R vs K or K+P vs K because rook can mate
+        and pawn can promote on this board.
+        """
+        pieces = []
+        for r in range(BOARD_ROWS):
+            for c in range(BOARD_COLS):
+                p = self.board[r, c]
+                if p != 0:
+                    pieces.append(p)
+
+        # K vs K
+        if len(pieces) == 2 and all(abs(x) == PIECE_WK for x in pieces):
+            return True
+
+        # exactly 3 pieces: K + minor vs K
+        if len(pieces) == 3:
+            absvals = [abs(x) for x in pieces]
+            # need exactly two kings
+            if absvals.count(PIECE_WK) == 2:
+                # find the non-king
+                for x in pieces:
+                    ax = abs(x)
+                    if ax != PIECE_WK:
+                        if ax == PIECE_WN or ax == PIECE_WB:
+                            return True
+        return False
+
+    def _is_fifty_move_draw(self):
+        """
+        50-move rule analogue:
+        In chess it's 50 moves (i.e. 100 plies) with no pawn move or capture.
+        We're tracking half-moves (plies). If halfmove_clock >= 100 -> draw.
+        """
+        return self.halfmove_clock >= 100
+
+    def _is_threefold_repetition(self):
+        """
+        Threefold repetition: same position (including side to move and castle rights)
+        has appeared at least 3 times.
+        """
+        counts = {}
+        for h in self.repetition_history:
+            counts[h] = counts.get(h, 0) + 1
+            if counts[h] >= 3:
+                return True
+        return False
 
     def _check_terminal(self):
         stm = self.side_to_move
         legal = self.generate_legal_moves(stm)
-        if len(legal) > 0:
-            return False, None
-        if self._is_in_check(stm):
-            return True, 1 if -stm == WHITE else -1
-        return True, 0
+
+        # no legal moves -> checkmate or stalemate
+        if len(legal) == 0:
+            if self._is_in_check(stm):
+                # checkmate: side to move is mated, other side wins
+                return True, 1 if -stm == WHITE else -1
+            else:
+                # stalemate draw
+                return True, 0
+
+        # insufficient material draw
+        if self._is_insufficient_material():
+            return True, 0
+
+        # 50-move rule draw
+        if self._is_fifty_move_draw():
+            return True, 0
+
+        # threefold repetition draw
+        if self._is_threefold_repetition():
+            return True, 0
+
+        # otherwise game continues
+        return False, None
+
+
+__all__ = ["MicrochessEnv"]
+
+if __name__ == "__main__":
+    env = MicrochessEnv()
+    obs = env.reset()
+    print("Observation shape:", obs.shape)
+    print("Number of actions:", ACTION_SIZE)
